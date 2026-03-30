@@ -1,0 +1,12 @@
+{
+  "name": "db-safety",
+  "version": "1.0.0",
+  "description": "Database safety - prevent accidental data destruction, migration safety checks",
+  "author": {
+    "name": "Matt Hesketh",
+    "email": "matt@heskethwebdesign.co.uk"
+  },
+  "repository": "https://github.com/wrxck/db-safety",
+  "license": "MIT",
+  "keywords": ["database", "safety", "migration", "postgres", "mysql", "redis", "mongodb", "docker-volumes"]
+}
