@@ -1,5 +1,7 @@
 # db-safety
 
+[![CI](https://github.com/wrxck/db-safety/actions/workflows/ci.yml/badge.svg)](https://github.com/wrxck/db-safety/actions/workflows/ci.yml)
+
 Database safety guards for Claude Code sessions.
 
 ## What it checks
