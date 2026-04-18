@@ -13,7 +13,6 @@ import re
 import sys
 
 
-# commands that trigger migration checks
 MIGRATION_COMMANDS = [
     r'\bprisma\s+migrate\s+deploy\b',
     r'\bprisma\s+db\s+push\b',
@@ -21,7 +20,7 @@ MIGRATION_COMMANDS = [
     r'\bdrizzle-kit\s+migrate\b',
 ]
 
-# destructive SQL patterns
+
 DESTRUCTIVE_SQL = [
     (r'\bDROP\s+TABLE\b', 'DROP TABLE'),
     (r'\bDROP\s+COLUMN\b', 'DROP COLUMN'),
@@ -31,21 +30,14 @@ DESTRUCTIVE_SQL = [
     (r'\bDROP\s+SCHEMA\b', 'DROP SCHEMA'),
 ]
 
-# safe SQL patterns (no warning needed)
-SAFE_SQL = [
-    r'\bCREATE\s+TABLE\b',
-    r'\bADD\s+COLUMN\b',
-    r'\bCREATE\s+INDEX\b',
-    r'\bCREATE\s+UNIQUE\s+INDEX\b',
-    r'\bALTER\s+TABLE\s+\S+\s+ADD\b',
-]
 
-# production indicators in connection strings or environment
 PROD_INDICATORS = [
-    r'production',
-    r'prod\b',
-    r'\.com\b',
-    r'\.io\b',
+    r'\bproduction\b',
+    r'\bprod-',
+    r'\.prod\.',
+    r'\bprod_',
+    r'\bPROD\b',
+    r'PRODUCTION',
     r'rds\.amazonaws',
     r'neon\.tech',
     r'supabase\.co',
@@ -53,45 +45,65 @@ PROD_INDICATORS = [
 ]
 
 
-def read_sql_file(command: str) -> str | None:
-    """try to find and read a .sql file referenced in the command"""
-    # look for .sql file references
+def project_cwd(input_data: dict, tool_input: dict) -> str:
+    fp = tool_input.get('file_path')
+    if fp:
+        try:
+            parent = os.path.dirname(os.path.abspath(fp))
+            if parent and os.path.isdir(parent):
+                return parent
+        except OSError:
+            pass
+    for key in ('cwd', 'workingDirectory', 'project_dir'):
+        val = input_data.get(key)
+        if val and isinstance(val, str) and os.path.isdir(val):
+            return val
+    return os.getcwd()
+
+
+def read_sql_file(command: str, base_dir: str) -> str | None:
     sql_files = re.findall(r'[\w./-]+\.sql\b', command)
     for sql_file in sql_files:
-        # resolve relative paths
-        if not os.path.isabs(sql_file):
-            sql_file = os.path.join(os.getcwd(), sql_file)
+        path = sql_file
+        if not os.path.isabs(path):
+            path = os.path.join(base_dir, path)
         try:
-            with open(sql_file, 'r') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 return f.read()
-        except (FileNotFoundError, PermissionError):
+        except (FileNotFoundError, PermissionError, OSError):
             continue
     return None
 
 
-def check_command(command: str) -> tuple[str | None, bool]:
-    """check migration command safety.
-    returns (message, is_blocking) — message is None if safe."""
+def env_database_url_is_prod() -> bool:
+    val = os.environ.get('DATABASE_URL', '')
+    if not val:
+        return False
+    return bool(re.search(r'(prod|production)', val, re.IGNORECASE))
 
-    # check for prisma db push (potentially destructive)
+
+def looks_prod(command: str) -> bool:
+    for indicator in PROD_INDICATORS:
+        if re.search(indicator, command, re.IGNORECASE):
+            return True
+    return env_database_url_is_prod()
+
+
+def check_command(command: str, base_dir: str) -> tuple[str | None, bool]:
     if re.search(r'\bprisma\s+db\s+push\b', command):
-        # check if targeting production
-        for indicator in PROD_INDICATORS:
-            if re.search(indicator, command, re.IGNORECASE):
-                return (
-                    'BLOCKED: "prisma db push" against what appears to be a production database.\n'
-                    'prisma db push can drop columns and tables to match schema.\n'
-                    'use "prisma migrate deploy" with reviewed migration files instead.',
-                    True,
-                )
-        # even non-prod, warn
+        if looks_prod(command):
+            return (
+                'BLOCKED: "prisma db push" targeting a production database.\n'
+                'prisma db push can drop columns and tables to match schema.\n'
+                'use "prisma migrate deploy" with reviewed migration files instead.',
+                True,
+            )
         return (
             'WARNING: "prisma db push" can drop columns and data to match schema.\n'
             'ensure this is a development database. for production, use "prisma migrate deploy".',
             False,
         )
 
-    # check for other migration commands (warn, don't block)
     for pattern in MIGRATION_COMMANDS:
         if re.search(pattern, command):
             return (
@@ -100,15 +112,13 @@ def check_command(command: str) -> tuple[str | None, bool]:
                 False,
             )
 
-    # check for psql/mysql with .sql file
     if re.search(r'\b(psql|mysql)\b', command):
-        sql_content = read_sql_file(command)
+        sql_content = read_sql_file(command, base_dir)
         if sql_content:
             destructive = []
             for pattern, name in DESTRUCTIVE_SQL:
                 if re.search(pattern, sql_content, re.IGNORECASE):
                     destructive.append(name)
-
             if destructive:
                 return (
                     f'BLOCKED: destructive migration detected in SQL file.\n'
@@ -124,34 +134,32 @@ def main():
     try:
         input_data = json.load(sys.stdin)
     except json.JSONDecodeError:
-        sys.exit(0)
+        print("BLOCKED: migration-safety failed to parse hook input", file=sys.stderr)
+        sys.exit(2)
 
     tool_input = input_data.get('tool_input', {})
     command = tool_input.get('command', '')
-
     if not command:
         sys.exit(0)
 
-    # quick check — does the command involve any migration-related tools?
     if not any(kw in command.lower() for kw in ['prisma', 'drizzle', 'psql', 'mysql', '.sql']):
         sys.exit(0)
 
-    message, is_blocking = check_command(command)
+    base_dir = project_cwd(input_data, tool_input)
 
+    message, is_blocking = check_command(command, base_dir)
     if message:
         if is_blocking:
             print(message, file=sys.stderr)
             sys.exit(2)
-        else:
-            # non-blocking warning via additionalContext
-            output = {
-                'hookSpecificOutput': {
-                    'hookEventName': 'PreToolUse',
-                    'additionalContext': message,
-                }
+        output = {
+            'hookSpecificOutput': {
+                'hookEventName': 'PreToolUse',
+                'additionalContext': message,
             }
-            print(json.dumps(output))
-            sys.exit(0)
+        }
+        print(json.dumps(output))
+        sys.exit(0)
 
     sys.exit(0)
 

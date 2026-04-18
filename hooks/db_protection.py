@@ -1,39 +1,28 @@
 #!/usr/bin/env python3
 """
-Claude Code hook to protect production databases from accidental deletion.
+Claude Code PreToolUse hook to protect production databases from accidental deletion.
 Blocks commands that could destroy Docker volumes, database data, or
 database containers in destructive ways.
 """
 
 import json
+import os
 import re
 import sys
+from pathlib import Path
 
 
-# Named volumes used by production databases
-PROD_VOLUMES = [
-    'postgres_data',
-    'mysql_data',
-    'redis_data',
-    'mongodb_data',
-    'moltbook-stats_pgdata',
-    'natures-art_postgres_data',
-    'natures-art_redis_data',
-    'image-merger_redis-data',
-    'thimble_postgres_data',
-]
+DEFAULT_VOLUME_PATTERN = r'.*_(data|pgdata|mysql|mongo|postgres|redis)$'
 
-# Production database container names
+
 PROD_CONTAINERS = [
     'shared-postgres',
     'shared-mysql',
     'shared-redis',
     'shared-mongodb',
-    'moltbook-stats-db',
-    'natures-art-db',
 ]
 
-# Paths where Docker stores volume data
+
 DOCKER_DATA_PATHS = [
     r'/var/lib/docker/volumes',
     r'/var/lib/docker',
@@ -42,74 +31,140 @@ DOCKER_DATA_PATHS = [
 ]
 
 
-def check_command(command: str) -> str | None:
-    """check if command could destroy production database data.
-    returns a reason string if blocked, None if safe."""
+VOLUME_FLAG_RE = r'(?:-v\b|-vf\b|-fv\b|-V\b|--volumes\b)'
 
-    # docker compose down -v / --volumes (removes volumes)
-    if re.search(r'\bdocker\s+compose\b.*\bdown\b.*(?:-v\b|--volumes\b)', command):
-        return 'docker compose down -v removes all named volumes including database data'
-    if re.search(r'\bdocker-compose\b.*\bdown\b.*(?:-v\b|--volumes\b)', command):
-        return 'docker-compose down -v removes all named volumes including database data'
 
-    # docker volume rm (any production volume)
-    if re.search(r'\bdocker\s+volume\s+rm\b', command) or re.search(r'\bdocker\s+volume\s+remove\b', command):
-        for vol in PROD_VOLUMES:
-            if vol in command:
-                return f'would delete production volume: {vol}'
-        # also block blanket volume removal without specific names
-        if re.search(r'\bdocker\s+volume\s+rm\s+\$', command):
-            return 'bulk volume removal could delete production volumes'
+def load_user_config() -> dict:
+    try:
+        home = Path.home()
+        path = home / '.claude' / 'db-safety.json'
+        if path.is_file():
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
 
-    # docker volume prune
-    if re.search(r'\bdocker\s+volume\s+prune\b', command):
-        return 'docker volume prune can delete production volumes not currently in use'
 
-    # docker system prune --volumes
-    if re.search(r'\bdocker\s+system\s+prune\b', command):
-        if re.search(r'--volumes\b', command):
-            return 'docker system prune --volumes deletes all unused volumes including database data'
-        if re.search(r'-a\b|--all\b', command):
-            return 'docker system prune -a can affect database images; use without -a or --volumes'
+def compile_volume_matcher(config: dict):
+    explicit = config.get('prod_volumes') or []
+    patterns = config.get('prod_volume_patterns') or []
 
-    # docker rm -v (removes anonymous volumes attached to container)
-    if re.search(r'\bdocker\s+rm\b.*-v', command):
-        for container in PROD_CONTAINERS:
-            if container in command:
-                return f'docker rm -v would delete volumes attached to production database: {container}'
+    compiled_patterns = []
+    for p in patterns:
+        try:
+            compiled_patterns.append(re.compile(p))
+        except re.error:
+            continue
 
-    # direct rm of docker volume paths or database data directories
-    if re.search(r'\brm\b', command):
+    if not explicit and not compiled_patterns:
+        compiled_patterns.append(re.compile(DEFAULT_VOLUME_PATTERN))
+
+    def matches(name: str) -> bool:
+        if name in explicit:
+            return True
+        for pattern in compiled_patterns:
+            if pattern.search(name):
+                return True
+        return False
+
+    return matches
+
+
+def split_commands(command: str) -> list[str]:
+    parts = re.split(r'(?:\|\||&&|;|\|)', command)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def acknowledged_volume(env_name: str | None) -> str | None:
+    if env_name is None:
+        return None
+    val = os.environ.get('CLAUDE_ACKNOWLEDGE_VOLUME_DESTRUCTION', '')
+    return val.strip() if val.strip() else None
+
+
+def check_segment(segment: str, volume_matches) -> str | None:
+    if re.search(r'\bdocker\s+compose\b.*\bdown\b.*' + VOLUME_FLAG_RE, segment) or \
+       re.search(VOLUME_FLAG_RE + r'.*\bdocker\s+compose\b.*\bdown\b', segment):
+        return 'docker compose down with volume removal flag - removes named volumes including database data'
+    if re.search(r'\bdocker-compose\b.*\bdown\b.*' + VOLUME_FLAG_RE, segment) or \
+       re.search(VOLUME_FLAG_RE + r'.*\bdocker-compose\b.*\bdown\b', segment):
+        return 'docker-compose down with volume removal flag - removes named volumes including database data'
+
+    if re.search(r'\bdocker\s+compose\b.*\bdown\b', segment):
+        if re.search(r'\s-[a-zA-Z]*v[a-zA-Z]*\b', segment) or re.search(r'--volumes\b', segment):
+            return 'docker compose down -v variant detected - removes named volumes'
+
+    if re.search(r'\bdocker\s+volume\s+(?:rm|remove)\b', segment):
+        if re.search(r'\bdocker\s+volume\s+(?:rm|remove)\s+.*\$\(', segment) or \
+           re.search(r'\bdocker\s+volume\s+(?:rm|remove)\s+.*`', segment):
+            return 'docker volume rm with subshell expansion - dynamic content cannot be verified safely'
+        acknowledged = acknowledged_volume('CLAUDE_ACKNOWLEDGE_VOLUME_DESTRUCTION')
+        m = re.search(r'\bdocker\s+volume\s+(?:rm|remove)\b(.*)$', segment)
+        tail = m.group(1) if m else ''
+        tokens = [t for t in re.split(r'\s+', tail.strip()) if t and not t.startswith('-')]
+        if not tokens:
+            return 'docker volume rm without explicit arguments - would be interactive or match nothing safely'
+        flagged = [t for t in tokens if volume_matches(t)]
+        if flagged:
+            if acknowledged and acknowledged in flagged and len(flagged) == 1:
+                return None
+            return f'would delete volumes matching production pattern: {", ".join(flagged)}'
+        if acknowledged is None:
+            return (
+                'docker volume rm blocked by default - set '
+                'CLAUDE_ACKNOWLEDGE_VOLUME_DESTRUCTION=<volume> to allow'
+            )
+
+    if re.search(r'\bdocker\s+volume\s+prune\b', segment):
+        return 'docker volume prune can delete volumes not currently attached to a running container'
+
+    if re.search(r'\bdocker\s+system\s+prune\b', segment):
+        if re.search(r'--volumes\b', segment):
+            return 'docker system prune --volumes deletes unused volumes including database data'
+        if re.search(r'\s-a\b|--all\b', segment):
+            return 'docker system prune -a can affect database images'
+
+    if re.search(r'\bdocker\s+rm\b', segment):
+        if re.search(r'\s-[a-zA-Z]*v[a-zA-Z]*\b', segment) or re.search(r'--volumes\b', segment):
+            for container in PROD_CONTAINERS:
+                if container in segment:
+                    return f'docker rm -v against production database container: {container}'
+            if re.search(r'\bdocker\s+rm\b.*\$\(', segment):
+                return 'docker rm -v with subshell expansion - cannot verify targets'
+
+    if re.search(r'\brm\b', segment):
         for path in DOCKER_DATA_PATHS:
-            if re.search(path, command):
+            if re.search(path, segment):
                 return f'rm targeting {path} would destroy database data on disk'
 
-    # DROP DATABASE in raw SQL or psql/mysql commands
-    if re.search(r'\bDROP\s+DATABASE\b', command, re.IGNORECASE):
-        return 'DROP DATABASE would permanently destroy a production database'
-
-    # dropping all tables
-    if re.search(r'\bDROP\s+SCHEMA\s+.*CASCADE\b', command, re.IGNORECASE):
+    if re.search(r'\bDROP\s+DATABASE\b', segment, re.IGNORECASE):
+        return 'DROP DATABASE would permanently destroy a database'
+    if re.search(r'\bDROP\s+SCHEMA\s+.*CASCADE\b', segment, re.IGNORECASE):
         return 'DROP SCHEMA CASCADE would destroy all tables in the schema'
+    if re.search(r'\bdropdb\b', segment):
+        return 'dropdb would permanently destroy a PostgreSQL database'
+    if re.search(r'\bmysqladmin\b.*\bdrop\b', segment):
+        return 'mysqladmin drop would permanently destroy a MySQL database'
+    if re.search(r'db\.dropDatabase\(\)', segment):
+        return 'db.dropDatabase() would permanently destroy a MongoDB database'
+    if re.search(r'\bmongosh?\b.*--eval.*dropDatabase', segment):
+        return 'mongosh dropDatabase would permanently destroy a MongoDB database'
+    if re.search(r'\bredis-cli\b.*\bFLUSHALL\b', segment, re.IGNORECASE):
+        return 'FLUSHALL would wipe all data from Redis'
+    if re.search(r'\bredis-cli\b.*\bFLUSHDB\b', segment, re.IGNORECASE):
+        return 'FLUSHDB would wipe data from a Redis database'
 
-    # truncating entire databases via CLI tools
-    if re.search(r'\bdropdb\b', command):
-        return 'dropdb would permanently destroy a production PostgreSQL database'
-    if re.search(r'\bmysqladmin\b.*\bdrop\b', command):
-        return 'mysqladmin drop would permanently destroy a production MySQL database'
+    return None
 
-    # mongo database drop
-    if re.search(r'db\.dropDatabase\(\)', command):
-        return 'db.dropDatabase() would permanently destroy a production MongoDB database'
-    if re.search(r'\bmongosh?\b.*--eval.*dropDatabase', command):
-        return 'mongosh dropDatabase would permanently destroy a production MongoDB database'
 
-    # redis FLUSHALL / FLUSHDB
-    if re.search(r'\bredis-cli\b.*\bFLUSHALL\b', command, re.IGNORECASE):
-        return 'FLUSHALL would wipe all data from production Redis'
-    if re.search(r'\bredis-cli\b.*\bFLUSHDB\b', command, re.IGNORECASE):
-        return 'FLUSHDB would wipe data from a production Redis database'
-
+def check_command(command: str, volume_matches) -> str | None:
+    for segment in split_commands(command):
+        reason = check_segment(segment, volume_matches)
+        if reason:
+            return reason
     return None
 
 
@@ -117,15 +172,18 @@ def main():
     try:
         input_data = json.load(sys.stdin)
     except json.JSONDecodeError:
-        sys.exit(0)
+        print("BLOCKED: db-safety failed to parse hook input", file=sys.stderr)
+        sys.exit(2)
 
     tool_input = input_data.get('tool_input', {})
     command = tool_input.get('command', '')
-
     if not command:
         sys.exit(0)
 
-    reason = check_command(command)
+    config = load_user_config()
+    volume_matches = compile_volume_matcher(config)
+
+    reason = check_command(command, volume_matches)
     if reason:
         print("BLOCKED: production database protection", file=sys.stderr)
         print("", file=sys.stderr)
